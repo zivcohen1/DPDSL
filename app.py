@@ -13,7 +13,8 @@ from dp_rewriter import rewrite_and_execute, BudgetManager
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24).hex())
 
-DB_PATH = "employee_faker.db"
+# Use absolute path to database file (works in any working directory)
+DB_PATH = os.path.join(os.path.dirname(__file__), "employee_faker.db")
 
 # --- Database connection helper ---
 def get_db():

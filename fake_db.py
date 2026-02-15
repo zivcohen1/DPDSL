@@ -5,12 +5,14 @@ Creates realistic 100k employee database and runs comprehensive privacy tests
 
 import sqlite3
 import sys
+import os
 from faker import Faker
 import numpy as np
 import pandas as pd
 
 # === CONFIGURATION ===
-DB_NAME = 'employee_faker.db'
+# Use absolute path to database file (works in any working directory)
+DB_NAME = os.path.join(os.path.dirname(__file__), 'employee_faker.db')
 LOCALE = 'en_US'
 RECORD_COUNT = 100_000  # 100k employees for realistic testing
 

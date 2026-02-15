@@ -3,12 +3,11 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Databases (generated at build time)
-*.db
+# SQLite databases - IMPORTANT: Keep these committed!
+# *.db  <-- DO NOT uncomment this line!
+# We NEED .db files in Git for Render deployment
 
-# Generated data / logs
-*.csv
-hipaa_audit_log.jsonl
+
 
 # ANTLR binary (download separately if needed)
 antlr-4.13.1-complete.jar

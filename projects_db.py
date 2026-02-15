@@ -5,7 +5,8 @@ import sys
 import os
 
 # === CONFIGURATION ===
-DB_NAME = 'employee_faker.db'
+# Use absolute path to database file (works in any working directory)
+DB_NAME = os.path.join(os.path.dirname(__file__), 'employee_faker.db')
 PROJECT_COUNT = 50000  # 50k projects
 LOCALE = 'en_US'
 
