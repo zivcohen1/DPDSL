@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Databases (generated at build time)
+*.db
+
+# Generated data / logs
+*.csv
+hipaa_audit_log.jsonl
+
+# ANTLR binary (download separately if needed)
+antlr-4.13.1-complete.jar
+
+# Claude Code temp files
+tmpclaude-*
+
+# OS
+.DS_Store
+Thumbs.db
+nul
+
+# IDE
+.vscode/
+.idea/

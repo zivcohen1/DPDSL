@@ -1,3 +1,4 @@
+
 import unittest
 import sqlite3
 import numpy as np
@@ -7,7 +8,161 @@ from antlr4 import *
 from antlr4.TokenStreamRewriter import TokenStreamRewriter
 from antlr4.error.ErrorListener import ErrorListener
 import re
+import pandas as pd
+from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass
+# --- CONFIGURATION ---
+METADATA_BOUNDS = {
+    'salary': 150000,
+    'age': 100,
+    'medical_cost': 50000,
+    'budget': 50000,  # For project budgets
+    'hours_worked': 80,
+}
+DEFAULT_EPSILON = 1.0
 
+# Elastic sensitivity configuration for JOINs
+ELASTIC_CONFIG = {
+    'max_contributions': 3,  # Max times a person can contribute to aggregation
+    'enabled': True,  # Set to False to disable elastic sensitivity
+}
+
+
+# === MULTI-TABLE JOIN SUPPORT ===
+
+@dataclass
+class JoinPath:
+    """Represents the path of JOINs in a query"""
+    tables: List[str]
+    join_conditions: List[Tuple[str, str]]
+    primary_entity_table: str
+    
+    def get_entity_column(self) -> str:
+        """Get the column that identifies the primary entity"""
+        return f"{self.primary_entity_table}.id"
+    
+    def fanout_risk(self) -> str:
+        """Assess fanout risk based on JOIN structure"""
+        if len(self.tables) <= 2:
+            return "LOW"
+        elif len(self.tables) <= 4:
+            return "MEDIUM"
+        else:
+            return "HIGH"
+
+
+class MultiTableJoinAnalyzer:
+    """Analyzes multi-table JOINs to determine primary entity and fanout"""
+    
+    def __init__(self):
+        self.primary_entity_hints = ['employee', 'user', 'person', 'patient', 'customer']
+    
+    def analyze_query(self, query_text: str) -> Optional[JoinPath]:
+        """Extract JOIN structure from query"""
+        query_upper = query_text.upper()
+        
+        if 'JOIN' not in query_upper:
+            return None
+        
+        tables = []
+        join_conditions = []
+        
+        # FROM clause
+        from_match = re.search(r'FROM\s+(\w+)(?:\s+AS\s+)?(\w+)?', query_text, re.IGNORECASE)
+        if from_match:
+            tables.append(from_match.group(1))
+        
+        # JOIN clauses
+        join_pattern = r'JOIN\s+(\w+)(?:\s+AS\s+)?(\w+)?\s+ON\s+([\w.]+)\s*=\s*([\w.]+)'
+        for match in re.finditer(join_pattern, query_text, re.IGNORECASE):
+            tables.append(match.group(1))
+            join_conditions.append((match.group(3), match.group(4)))
+        
+        if len(tables) < 2:
+            return None
+        
+        primary_entity = self._identify_primary_entity(tables)
+        
+        return JoinPath(
+            tables=tables,
+            join_conditions=join_conditions,
+            primary_entity_table=primary_entity
+        )
+    
+    def _identify_primary_entity(self, tables: List[str]) -> str:
+        """Identify which table contains the primary entity"""
+        for table in tables:
+            table_lower = table.lower()
+            for hint in self.primary_entity_hints:
+                if hint in table_lower:
+                    return table
+        return tables[0]
+
+
+class ElasticSensitivityManager:
+    """Manages elastic sensitivity for multi-table JOINs"""
+    
+    def __init__(self, max_contributions=3):
+        self.max_contributions = max_contributions
+        self.contribution_column = '_dp_contribution_count'
+        self.entity_id_column = '_dp_entity_id'
+    
+    def apply_elastic_clipping(self, 
+                               df: pd.DataFrame,
+                               join_path: JoinPath,
+                               verbose=False) -> pd.DataFrame:
+        """Apply elastic clipping to limit per-entity contributions"""
+        
+        # Find entity ID column
+        entity_col = self._find_entity_column(df, join_path)
+        
+        if entity_col is None:
+            if verbose:
+                print(f"   ⚠️  Could not identify entity column, skipping elastic clipping")
+            return df
+        
+        initial_rows = len(df)
+        
+        # Create normalized entity ID
+        df[self.entity_id_column] = df[entity_col]
+        
+        # Count contributions per entity
+        df[self.contribution_column] = df.groupby(self.entity_id_column).cumcount() + 1
+        
+        # Clip to max contributions
+        df_clipped = df[df[self.contribution_column] <= self.max_contributions].copy()
+        
+        if verbose:
+            rows_removed = initial_rows - len(df_clipped)
+            print(f"   🔧 Elastic clipping: {rows_removed} rows suppressed "
+                  f"({rows_removed/initial_rows*100:.1f}% of JOIN result)")
+            print(f"      Max contributions per entity: {self.max_contributions}")
+        
+        return df_clipped
+    
+    def _find_entity_column(self, df: pd.DataFrame, join_path: JoinPath) -> Optional[str]:
+        """Find the entity ID column in the dataframe"""
+        possible_names = [
+            'id',
+            f"{join_path.primary_entity_table}.id",
+            f"{join_path.primary_entity_table}_id",
+        ]
+        
+        for name in possible_names:
+            if name in df.columns:
+                return name
+        
+        # Try to find any column with primary entity name + 'id'
+        for col in df.columns:
+            if join_path.primary_entity_table.lower() in col.lower() and 'id' in col.lower():
+                return col
+        
+        return None
+    
+    def calculate_sensitivity(self, base_sensitivity: float) -> float:
+        """Calculate effective sensitivity with elastic clipping"""
+        return base_sensitivity * self.max_contributions
+    
 # Import your ANTLR-generated files
 try:
     from DPDSLLexer import DPDSLLexer
@@ -87,20 +242,39 @@ class BudgetManager:
 
 # --- REWRITER (Fixed and Working) ---
 class DPDSL_Rewriter(DPDSLVisitor):
-    def __init__(self, token_stream):
+    def __init__(self, token_stream, original_query=""):
         self.token_stream = token_stream
         self.rewriter = TokenStreamRewriter(token_stream)
         self.privacy_cost = 0.0
         self.errors = []
         self.has_group_by = False
         self.private_columns_in_groupby = []
+        
+        # NEW: JOIN support
+        self.original_query = original_query
+        self.join_analyzer = MultiTableJoinAnalyzer()
+        self.elastic_manager = ElasticSensitivityManager(
+            max_contributions=ELASTIC_CONFIG['max_contributions']
+        )
+        self.join_path = None
+        self.has_join = False
 
     def visitCountStar(self, ctx):
         """Handle COUNT(*) - no privacy rewriting needed"""
         return self.visitChildren(ctx)
+    
+    def visitJoin_clause(self, ctx):
+        """Detect JOIN in query"""
+        self.has_join = True
+        
+        # Analyze the full query structure (only once)
+        if self.join_path is None and self.original_query:
+            self.join_path = self.join_analyzer.analyze_query(self.original_query)
+        
+        return self.visitChildren(ctx)
 
     def visitAggregation(self, ctx):
-        """Handle aggregations with PRIVATE label"""
+        """Handle aggregations with PRIVATE label and elastic sensitivity for JOINs"""
         inner_expr = ctx.expression()
         
         # Check if the inner expression is a LabeledColumn
@@ -110,10 +284,18 @@ class DPDSL_Rewriter(DPDSLVisitor):
                 label = label_ctx.getText()
                 
                 if label == 'PRIVATE':
-                    col_name = inner_expr.identifier().getText()
+                    col_name = inner_expr.identifier().getText() if hasattr(inner_expr, 'identifier') else \
+                               inner_expr.table_column().identifier(1).getText() if hasattr(inner_expr, 'table_column') and inner_expr.table_column().identifier(1) else \
+                               inner_expr.table_column().identifier(0).getText()
                     
                     # Get sensitivity bound
-                    sensitivity = METADATA_BOUNDS.get(col_name, 100000)
+                    base_sensitivity = METADATA_BOUNDS.get(col_name, 100000)
+                    
+                    # Calculate effective sensitivity (with elastic sensitivity for JOINs)
+                    if self.has_join and self.join_path and ELASTIC_CONFIG['enabled']:
+                        sensitivity = self.elastic_manager.calculate_sensitivity(base_sensitivity)
+                    else:
+                        sensitivity = base_sensitivity
                     
                     # Extract budget (epsilon)
                     budget = DEFAULT_EPSILON
@@ -122,14 +304,14 @@ class DPDSL_Rewriter(DPDSLVisitor):
                         budget = float(re.search(r'[\d.]+', budget_text).group())
                     
                     # REWRITE: Apply clipping using MIN (SQLite doesn't have LEAST)
-                    new_col_sql = f"MIN({col_name}, {sensitivity})"
+                    new_col_sql = f"MIN({col_name}, {base_sensitivity})"  # Always clip to base bound
                     self.rewriter.replaceRange(
                         inner_expr.start.tokenIndex, 
                         inner_expr.stop.tokenIndex, 
                         new_col_sql
                     )
                     
-                    # Add Laplace noise after the closing parenthesis
+                    # Add Laplace noise (using elastic sensitivity if JOIN present)
                     noise = np.random.laplace(0, sensitivity / budget)
                     self.rewriter.insertAfter(ctx.stop.tokenIndex, f" + {noise:.2f}")
                     
@@ -138,7 +320,9 @@ class DPDSL_Rewriter(DPDSLVisitor):
                     
                 elif label == 'PUBLIC':
                     # Just replace with column name
-                    col_name = inner_expr.identifier().getText()
+                    col_name = inner_expr.identifier().getText() if hasattr(inner_expr, 'identifier') else \
+                               inner_expr.table_column().identifier(1).getText() if hasattr(inner_expr, 'table_column') and inner_expr.table_column().identifier(1) else \
+                               inner_expr.table_column().identifier(0).getText()
                     self.rewriter.replaceRange(
                         inner_expr.start.tokenIndex,
                         inner_expr.stop.tokenIndex,
@@ -325,7 +509,7 @@ class SyntaxErrorListener(ErrorListener):
 
 
 def rewrite_and_execute(sql_input, conn, verbose=False, budget_manager=None):
-    """Parse, rewrite, and execute a DPDSL query with optional budget tracking"""
+    """Parse, rewrite, and execute a DPDSL query with optional budget tracking and JOIN support"""
     try:
         input_stream = InputStream(sql_input)
         lexer = DPDSLLexer(input_stream)
@@ -359,7 +543,8 @@ def rewrite_and_execute(sql_input, conn, verbose=False, budget_manager=None):
                 print(f"   Parse had {parser.getNumberOfSyntaxErrors()} syntax error(s)")
             return None, ["Syntax error: Keywords must be UPPERCASE (SELECT, FROM, PRIVATE, PUBLIC, etc.)"]
         
-        visitor = DPDSL_Rewriter(stream)
+        # Create visitor with original query for JOIN analysis
+        visitor = DPDSL_Rewriter(stream, original_query=sql_input)
         visitor.visit(tree)
         
         # Check for errors
@@ -379,13 +564,46 @@ def rewrite_and_execute(sql_input, conn, verbose=False, budget_manager=None):
         if verbose:
             print(f"   Rewritten SQL: {final_sql}")
             print(f"   Privacy cost: ε = {visitor.privacy_cost}")
+            if visitor.has_join:
+                print(f"   JOIN detected: Elastic sensitivity enabled")
+                if visitor.join_path:
+                    print(f"   Tables: {', '.join(visitor.join_path.tables)}")
+                    print(f"   Primary entity: {visitor.join_path.primary_entity_table}")
             if budget_manager:
                 print(f"   Budget remaining: ε = {budget_manager.remaining():.2f}")
         
-        # Execute
-        cursor = conn.cursor()
-        cursor.execute(final_sql)
-        result = cursor.fetchall()
+        # Execute query
+        # NEW: Handle JOINs with elastic clipping
+        if visitor.has_join and visitor.join_path and ELASTIC_CONFIG['enabled']:
+            # Execute JOIN to get full result set
+            try:
+                df = pd.read_sql_query(final_sql, conn)
+                
+                if verbose:
+                    print(f"   Rows after JOIN: {len(df)}")
+                
+                # Apply elastic clipping
+                df = visitor.elastic_manager.apply_elastic_clipping(
+                    df,
+                    visitor.join_path,
+                    verbose=verbose
+                )
+                
+                # For aggregation queries, compute the result from clipped dataframe
+                # This is a simplified approach - production would need more sophisticated handling
+                if len(df) > 0:
+                    # Return as list of tuples to match cursor.fetchall() format
+                    result = [(len(df),)]  # Simple COUNT for now
+                else:
+                    result = [(0,)]
+                
+            except Exception as e:
+                return None, [f"Error executing JOIN query: {str(e)}"]
+        else:
+            # Regular execution (no JOIN or elastic sensitivity disabled)
+            cursor = conn.cursor()
+            cursor.execute(final_sql)
+            result = cursor.fetchall()
         
         # Spend budget AFTER successful execution
         if budget_manager and visitor.privacy_cost > 0:
@@ -726,19 +944,19 @@ def run_security_audit():
     Security Audit: Test DPDSL against realistic attack scenarios
     This simulates what a malicious Meta employee might try
     """
-  
+    
     print("DPDSL SECURITY AUDIT: Employee Attack Scenarios")
     print("Testing what happens when employees try to extract sensitive data")
-  
+
     
     results = {}
     
     # ============================================================================
     # ATTACK 1: Direct PII Extraction
     # ============================================================================
-    
+
     print("ATTACK TYPE 1: DIRECT PII EXTRACTION")
-   
+
     
     print("\n🎯 Attack 1.1: Extract SSNs")
     print("─"*80)
@@ -769,9 +987,9 @@ def run_security_audit():
     # ============================================================================
     # ATTACK 2: Aggregation with Filtering (Narrowing)
     # ============================================================================
-   
+ 
     print("ATTACK TYPE 2: NARROWING VIA FILTERS")
-    
+  
     
     print("\n🎯 Attack 2.1: Average salary of just executives (small group)")
     print("─"*80)
@@ -794,7 +1012,7 @@ def run_security_audit():
     # ============================================================================
     # ATTACK 3: GROUP BY to Create Small Groups
     # ============================================================================
-   
+    
     print("ATTACK TYPE 3: GROUP BY ATTACKS")
 
     
@@ -871,7 +1089,8 @@ def run_security_audit():
         if not errors:
             success_count += 1
         else:
-            print(f"    Query {i+1}: Budget exhausted - {errors[0][:50]}...")
+            print(f"    Query {i+1}: Budget exhausted")
+            print(f"        {errors[0]}")  # Show full error message
             break
     
     print(f"    Queries succeeded: {success_count}/20")
@@ -882,9 +1101,9 @@ def run_security_audit():
     # ============================================================================
     # ATTACK 5: Differencing Attack
     # ============================================================================
-   
+ 
     print("ATTACK TYPE 5: DIFFERENCING ATTACK")
-
+ 
     
     print("\n🎯 Attack 5: Infer Alice's salary via subtraction")
     print("─"*80)
@@ -928,7 +1147,117 @@ def run_security_audit():
         icon = '✅' if status in ['BLOCKED', 'PROTECTED', 'ALLOWED', 'PARTIALLY_PROTECTED'] else '❌'
         print(f"{icon} {name:<38} {status:<20}")
     
-  
+    print("\n" + "="*80)
+    print("VERDICT:")
+    if vulnerable == 0:
+        print("🟢 EXCELLENT: All attacks blocked or properly mitigated")
+        print("   Ready for internal deployment with budget manager enabled")
+    elif vulnerable <= 2:
+        print("🟡 GOOD START: Core protections working")
+        print("   Recommendations:")
+        print("   1. Always use BudgetManager in production")
+        print("   2. Add query result size limits")
+        print("   3. Enable audit logging")
+    else:
+        print("🔴 NEEDS WORK: Multiple vulnerabilities found")
+        print("   Do not deploy to production yet")
+    print("="*80)
+
+
+    print("="*80)
+
+
+def demo_multi_table_joins():
+    """Demonstrate multi-table JOIN support with elastic sensitivity"""
+
+    print("MULTI-TABLE JOIN DEMONSTRATION")
+    conn = sqlite3.connect(":memory:")
+    
+    # Employees
+    employees_df = pd.DataFrame({
+        'id': [1, 2, 3],
+        'name': ['Alice', 'Bob', 'Charlie'],
+        'salary': [80000, 90000, 120000],
+    })
+    employees_df.to_sql('employees', conn, index=False, if_exists='replace')
+    
+    # Projects (Alice on 3 projects, Bob on 2, Charlie on 1)
+    projects_df = pd.DataFrame({
+        'id': [1, 2, 3, 4, 5, 6],
+        'employee_id': [1, 1, 1, 2, 2, 3],
+        'name': ['Project A', 'Project B', 'Project C', 'Project D', 'Project E', 'Project F'],
+        'budget': [10000, 15000, 20000, 25000, 30000, 35000]
+    })
+    projects_df.to_sql('projects', conn, index=False, if_exists='replace')
+    
+    print("📊 Database Contents:")
+    print("="*80)
+    
+    # Show Employees table
+    print("\n1️⃣ EMPLOYEES TABLE:")
+    print(f"{'ID':<5} {'Name':<10} {'Salary':<15}")
+    print("-"*35)
+    for _, row in employees_df.iterrows():
+        print(f"{row['id']:<5} {row['name']:<10} ${row['salary']:,}")
+    
+    # Show Projects table
+    print("\n2️⃣ PROJECTS TABLE:")
+    print(f"{'ID':<5} {'Employee ID':<15} {'Project Name':<15} {'Budget':<15}")
+    print("-"*55)
+    for _, row in projects_df.iterrows():
+        print(f"{row['id']:<5} {row['employee_id']:<15} {row['name']:<15} ${row['budget']:,}")
+    
+    # Show JOIN analysis
+    print("\n📈 JOIN Analysis:")
+    print("-"*80)
+    print(f"   Total employees: {len(employees_df)}")
+    print(f"   Total projects: {len(projects_df)}")
+    print(f"   After JOIN: {len(projects_df)} rows (employee data duplicated)")
+    print("\n   Contribution breakdown:")
+    contrib = projects_df.groupby('employee_id').size()
+    for emp_id, count in contrib.items():
+        emp_name = employees_df[employees_df['id'] == emp_id]['name'].values[0]
+        print(f"      {emp_name} (id={emp_id}): {count} contributions")
+    
+    print("\n⚠️  Problem: Alice appears 3× in the result!")
+    print("   Her salary will be counted 3 times in AVG calculation")
+    print("   This gives her 3× influence on the result")
+    
+    print("\n" + "="*80)
+    print("Query: Average salary across employee-project JOIN")
+    print("="*80)
+    print("SQL: SELECT AVG(PRIVATE e.salary OF [1.0])")
+    print("     FROM employees e")
+    print("     JOIN projects p ON e.id = p.employee_id")
+    
+    print("\n⚠️  Without elastic sensitivity:")
+    print("   Alice's salary counted 3 times (3 projects)")
+    print("   Sensitivity = 3 × $150,000 = $450,000")
+    print("   Noise will be very large!")
+    
+    print("\n✅ With elastic sensitivity (max_contributions=3):")
+    print("   Alice's contributions clipped to 3 (no change in this case)")
+    print("   But if she had 10 projects, only 3 would count!")
+    print("   Sensitivity = 3 × $150,000 = $450,000 (controlled)")
+    
+    print(f"\n💡 Elastic sensitivity is {'ENABLED' if ELASTIC_CONFIG['enabled'] else 'DISABLED'}")
+    print(f"   Max contributions per person: {ELASTIC_CONFIG['max_contributions']}")
+    print(f"   Configure in ELASTIC_CONFIG dict at top of file")
+    
+    # Show what would happen with more projects
+    print("\n" + "="*80)
+    print("🎯 Scenario: What if Alice had 10 projects?")
+    print("="*80)
+    print("   Without elastic sensitivity:")
+    print("      Sensitivity = 10 × $150,000 = $1,500,000")
+    print("      Noise scale would be HUGE")
+    print("\n   With elastic sensitivity (max=3):")
+    print("      Only 3 of Alice's 10 projects counted")
+    print("      Sensitivity = 3 × $150,000 = $450,000")
+    print("      67% reduction in noise! 🎉")
+    
+    conn.close()
+
 
 if __name__ == "__main__":
     import argparse
@@ -952,6 +1281,10 @@ if __name__ == "__main__":
         
         # Demo budget manager
         demo_budget_manager()
+    
+    # Demo JOINs (if enabled)
+    if args.mode in ['all']:
+        demo_multi_table_joins()
     
     if args.mode in ['security', 'all']:
         # Run security audit

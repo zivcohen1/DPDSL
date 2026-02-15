@@ -63,7 +63,9 @@ class DPDSLParser ( Parser ):
 
     literalNames = [ "<INVALID>", "','", "'('", "'*'", "')'", "'['", "']'", 
                      "'+'", "'-'", "'/'", "'>'", "'<'", "'='", "'>='", "'<='", 
-                     "'!='" ]
+                     "'!='", "'SELECT'", "'FROM'", "'WHERE'", "'GROUP'", 
+                     "'BY'", "'AS'", "'OF'", "'PRIVATE'", "'PUBLIC'", "'SUM'", 
+                     "'COUNT'", "'MAX'", "'AVG'", "'MIN'" ]
 
     symbolicNames = [ "<INVALID>", "<INVALID>", "<INVALID>", "<INVALID>", 
                       "<INVALID>", "<INVALID>", "<INVALID>", "<INVALID>", 

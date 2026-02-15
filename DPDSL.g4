@@ -17,7 +17,7 @@ select_item
 expression
     : function_name '(' '*' ')'                               # CountStar
     | function_name '(' expression (OF '[' budget ']')? ')'   # Aggregation
-    | label identifier                                        # ColumnRef
+    | label identifier                                        # LabeledColumn
     | expression operator expression                          # BinaryOp
     | '(' expression ')'                                      # Parens
     | INT                                                     # Literal
@@ -33,10 +33,10 @@ where_clause
     ;
 
 group_by_clause
-    : GROUP BY columnRef (',' columnRef)*
+    : GROUP BY groupByColumn (',' groupByColumn)*
     ;
 
-columnRef
+groupByColumn
     : label identifier
     ;
 
